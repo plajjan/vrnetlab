@@ -11,6 +11,11 @@ operating modes:
 
 The build process automatically produces both variants from a single qcow2 image.
 
+In addition, the image can be booted in a **ZTP mode** (`MODE=ztp`) that performs
+day-zero, DHCP-based Zero Touch Provisioning instead of applying a bootstrap
+config. This is meant for *testing* a ZTP server/workflow against c8000v -- see
+[Zero Touch Provisioning (ZTP) mode](#zero-touch-provisioning-ztp-mode) below.
+
 On installation of Catalyst 8000v the user is presented with the choice of
 output, which can be over serial console, a video console or through automatic
 detection of one or the other. Empirical studies show that the automatic
@@ -58,6 +63,114 @@ It's been tested to boot and respond to SSH with:
 ```bash
 docker run -d --privileged --name my-c8000v-router vr-c8000v
 ```
+
+## Zero Touch Provisioning (ZTP) mode
+
+Setting `MODE=ztp` boots the router "day zero" so that it runs IOS-XE
+DHCP-based Zero Touch Provisioning itself, instead of having vrnetlab feed it a
+bootstrap config. Use this when you want to **test a ZTP server/workflow** with
+c8000v.
+
+In this mode the launcher:
+
+- does **not** generate or mount the CVAC config ISO (`iosxe_config.txt`), and
+- ignores any user `startup-config.cfg`,
+
+because IOS-XE only enters ZTP when it boots with an **empty startup-config**.
+The router then DHCPs on its interfaces and uses DHCP option 67 (and option 150
+for TFTP) to fetch and run a provisioning artifact (a Python script executed in
+Guest Shell, or a plain IOS config). The node is marked "up" as soon as it
+obtains a DHCP lease on the management interface (or reaches an interactive
+prompt) -- the launcher cannot know when your provisioning completes, so watch
+the actual ZTP run with `telnet <node> 5000`.
+
+### Requirements
+
+- **A serial-enabled, *non-installed* image.** ZTP needs an empty
+  startup-config, but the autonomous install step bakes one in (`platform
+  console serial` + `license boot level`), which would disarm ZTP. Run ZTP mode
+  on a pristine, serial-enabled image -- the **controller-tagged build**
+  (`vr-c8000v:controller-VERSION`) is exactly such an image, so it is the one to
+  use (retag it to `vr-c8000v:ztp-VERSION` if you prefer a clearer name). Do
+  **not** use the default autonomous image.
+- **containerlab passthrough.** The router must reach a real DHCP/ZTP server, so
+  run it with `CLAB_MGMT_PASSTHROUGH=true` (and `CLAB_MGMT_DHCP=true`) and put a
+  DHCP/ZTP server on the same management network. The default host-forwarded
+  qemu networking is not a supported ZTP substrate.
+- **Licensing / serial console are the artifact's job.** Because nothing is
+  pre-applied, your ZTP artifact should set `license boot level ...` (for
+  premium throughput) and re-assert `platform console serial` if it does a
+  `write erase`/`reload`.
+
+### Environment variables
+
+| Variable               | Default      | Description                                                                 |
+| ---------------------- | ------------ | --------------------------------------------------------------------------- |
+| `MODE`                 | `autonomous` | Set to `ztp` to boot day-zero for DHCP-based ZTP (also `controller`).        |
+| `ZTP_BOOT_TIMEOUT`     | `600`        | Backstop: seconds of console idle after which the node is marked up if no DHCP lease / prompt was seen (best-effort, not a precise deadline). |
+| `CLAB_MGMT_PASSTHROUGH`| `false`      | Set `true` so the router's mgmt port is bridged to the clab mgmt network.    |
+| `CLAB_MGMT_DHCP`       | `false`      | Set `true` so vrnetlab does not assert a static mgmt address.               |
+
+### Example (containerlab)
+
+```yaml
+name: c8000v-ztp
+mgmt:
+  network: clab-mgmt
+  ipv4-subnet: 172.20.20.0/24
+topology:
+  nodes:
+    ztp-server:                 # dnsmasq: DHCP + TFTP/HTTP on the mgmt net
+      kind: linux
+      image: your/dnsmasq-http:latest
+      mgmt-ipv4: 172.20.20.10
+      binds:
+        - ztp/:/srv/ztp/
+    c8000v:
+      kind: cisco_c8000v
+      image: vr-c8000v:controller-17.16.01a   # pristine, serial-enabled image
+      env:
+        MODE: ztp
+        CLAB_MGMT_PASSTHROUGH: "true"
+        CLAB_MGMT_DHCP: "true"
+```
+
+dnsmasq on `ztp-server` serves option 67 (and 150 for the TFTP form):
+
+```
+dhcp-range=172.20.20.100,172.20.20.200,12h
+# HTTP form (no option 150 needed):
+dhcp-option=67,"http://172.20.20.10:8000/ztp.py"
+# --- or TFTP form ---
+# dhcp-option=150,172.20.20.10
+# dhcp-boot=/ztp.py
+enable-tftp
+tftp-root=/srv/ztp
+```
+
+`ztp/ztp.py` runs in Guest Shell (use a `.py` extension so the device executes
+it as Python) and applies the day-one config:
+
+```python
+import cli
+cli.configurep([
+    "hostname C8000V-ZTP-OK",
+    "platform console serial",
+    "license boot level network-premier addon dna-premier",
+    "username vrnetlab privilege 15 password VR-netlab9",
+    "line vty 0 4", "login local", "transport input ssh",
+])
+cli.cli("write memory")
+```
+
+Success looks like: the launcher logs *"ZTP: device reached interactive
+prompt"*, the dnsmasq/HTTP server logs the fetch of `ztp.py`, and `show run`
+reflects the artifact's config.
+
+> **Note:** the exact day-zero console banners vary by IOS-XE release, so the
+> launcher's progress markers are best-effort; the `ZTP_BOOT_TIMEOUT` fallback
+> always brings the node up so you can inspect it. ZTP is known to be flaky on
+> some older releases -- 17.15+/17.16 are recommended.
 
 ## Interface mapping
 

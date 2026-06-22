@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 import vrnetlab
+from scrapli.exceptions import ScrapliConnectionNotOpened, ScrapliTimeout
 
 STARTUP_CONFIG_FILE = "/config/startup-config.cfg"
 
@@ -63,8 +64,36 @@ class C8000v_vm(vrnetlab.VM):
         self.nic_type = "vmxnet3"
         self.image_name = "config.iso"
         self.mode = os.environ.get("MODE", "autonomous")
+        # ZTP mode backstop: seconds of console idle after which we mark the node
+        # up if no DHCP lease / interactive prompt was seen first (see
+        # bootstrap_spin). The primary path is the data-driven markers; this is
+        # only a fallback for a console that never produces a usable signal.
+        self.ztp_boot_timeout = vrnetlab.getenv_uint("ZTP_BOOT_TIMEOUT", 600)
 
-        if self.install_mode:
+        if self.mode == "ztp":
+            # Zero Touch Provisioning testbed: boot the router "day zero" so it
+            # performs DHCP-based ZTP itself. We must NOT apply any bootstrap
+            # config -- neither a CVAC config ISO (see the -cdrom guard below)
+            # nor a user startup-config -- because any startup-config disarms
+            # ZTP. This requires a serial-enabled, *non-installed* image: the
+            # autonomous install step bakes a startup-config (platform console
+            # serial + license boot level) that would disarm ZTP, so use a
+            # pristine image such as the controller-tagged build.
+            self.logger.warning(
+                "ZTP mode: booting day-zero with no bootstrap config. "
+                "Requires a serial-enabled, non-installed image."
+            )
+            if self.install_mode:
+                self.logger.info(
+                    "ZTP mode: nothing to install, leaving disk pristine"
+                )
+            elif os.path.exists(STARTUP_CONFIG_FILE):
+                self.logger.warning(
+                    f"ZTP mode: ignoring {STARTUP_CONFIG_FILE}; "
+                    "a startup-config disarms ZTP"
+                )
+            # No config ISO is generated or mounted in ZTP mode.
+        elif self.install_mode:
             self.logger.debug("Install mode")
             if self.mode == "controller":
                 # Controller mode uses serial-enabled images, no install needed
@@ -94,7 +123,10 @@ class C8000v_vm(vrnetlab.VM):
                 cfg = self.gen_bootstrap_config()
             self.create_config_image(cfg, install=False)
 
-        self.qemu_args.extend(["-cdrom", "/" + self.image_name])
+        # ZTP mode boots day-zero with no applied config, so we must not present
+        # the CVAC config ISO -- doing so would suppress ZTP.
+        if self.mode != "ztp":
+            self.qemu_args.extend(["-cdrom", "/" + self.image_name])
 
     def gen_install_config(self) -> str:
         """
@@ -239,6 +271,81 @@ vinitparam:
 
     def bootstrap_spin(self):
         """This function should be called periodically to do work."""
+
+        # ZTP mode: the router boots day-zero and runs DHCP-based Zero Touch
+        # Provisioning on its own. There is no CVAC-4-CONFIG_DONE marker to wait
+        # for; instead we mirror the console and mark the node up when it reaches
+        # an interactive EXEC prompt OR once the console has been idle for
+        # ZTP_BOOT_TIMEOUT seconds (whichever comes first). The ZTP run itself
+        # (DHCP, option-67 fetch, Guest Shell, script) is the user's experiment
+        # -- watch it via `telnet <node> 5000` once the node is up.
+        if self.mode == "ztp":
+            # The launcher's job in ZTP mode is just to get the node to a usable
+            # "up" state -- the actual provisioning is the user's experiment. We
+            # mark it up on the first reliable, data-driven signal: an
+            # interactive EXEC prompt, or a DHCP lease on the management
+            # interface (the box is on the network and day-zero ZTP can
+            # proceed). Watch the rest via `telnet <node> 5000`.
+            #
+            # While autoinstall/ZTP retries the console can go silent; bound the
+            # blocking read with ZTP_BOOT_TIMEOUT and treat a timeout as a
+            # last-resort "settled" signal. NOTE: scrapli's read timeout is
+            # best-effort -- the exception can be delayed until output next
+            # resumes -- so this is a backstop, not a precise deadline; the
+            # markers above are the primary path.
+            self.scrapli_tn.timeout_transport = self.ztp_boot_timeout
+            try:
+                (ridx, match, res) = self.con_expect(
+                    [
+                        b"Press RETURN to get started",      # 0: EXEC prompt -> up
+                        b"Acquired IPv4 address",            # 1: DHCP lease -> up
+                        b"starting autoinstall/pnp/ztp",     # 2: day-zero begun (log)
+                        b"Guestshell enabled successfully",  # 3: progress (log)
+                        b"%Error opening tftp",              # 4: diag (log)
+                    ]
+                )
+            except (ScrapliTimeout, ScrapliConnectionNotOpened):
+                self.logger.warning(
+                    "ZTP: console idle ~%ss with no prompt/DHCP lease; marking "
+                    "node up (provisioning may still be in progress -- inspect "
+                    "via telnet :5000 / SSH).",
+                    self.ztp_boot_timeout,
+                )
+                try:
+                    self.scrapli_tn.close()
+                except Exception:
+                    pass
+                self.running = True
+                return
+
+            # Console markers are best-effort and may vary by image version; the
+            # idle backstop above eventually marks the node up regardless.
+            if match and ridx in (0, 1):
+                reason = (
+                    "interactive prompt"
+                    if ridx == 0
+                    else "DHCP lease on management interface"
+                )
+                self.logger.info("ZTP: device up (%s).", reason)
+                self.scrapli_tn.close()
+                startup_time = datetime.datetime.now() - self.start_time
+                self.logger.info("Startup complete in: %s", startup_time)
+                self.running = True
+                return
+            elif match and ridx == 2:
+                self.logger.info("ZTP: day-zero provisioning started.")
+            elif match and ridx == 3:
+                self.logger.info("ZTP: Guest Shell enabled.")
+            elif match and ridx == 4:
+                self.logger.warning(
+                    "ZTP: TFTP fetch error (check DHCP option-67/150)."
+                )
+
+            # mirror any console output to docker logs
+            if res != b"":
+                self.write_to_stdout(res)
+
+            return
 
         # Controller mode install is a no-op (serial-enabled images)
         if self.install_mode and self.mode == "controller":
