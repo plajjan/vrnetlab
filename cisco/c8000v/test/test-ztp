@@ -1,0 +1,99 @@
+#!/bin/bash
+#
+# Functional end-to-end test for the c8000v ztp mode.
+#
+# It stands up a throwaway management network with a dnsmasq DHCP server (handing
+# out DHCP option 67 = an http:// URL) and a tiny HTTP server serving ztp.py,
+# then boots the c8000v under test in ztp + passthrough + DHCP mode and asserts:
+#
+#   1. the device becomes healthy   (launcher reached "up" on the DHCP lease)
+#   2. the device fetches ztp.py     (HTTP GET from its leased address)
+#   3. ztp.py is applied             (device renamed itself to C8000V-ZTP-OK)
+#
+# Requirements: docker, KVM (/dev/kvm), and a built *serial-enabled,
+# non-installed* c8000v image -- the controller-tagged build is exactly that,
+# e.g. vrnetlab/cisco_c8000v:controller-17.11.01a. This is NOT run by CI (it
+# needs KVM); run it by hand or on a KVM-capable runner.
+#
+# Usage: ./test-ztp [-t boot_timeout_seconds] <c8000v-image>
+set -u
+
+timeout=600
+while getopts "t:h" opt; do
+  case $opt in
+    t) timeout=$OPTARG ;;
+    h) echo "Usage: $0 [-t boot_timeout] <c8000v-image>"; exit 0 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+image=${1:-}
+if [ -z "$image" ]; then
+  echo "ERROR: need a c8000v image, e.g. vrnetlab/cisco_c8000v:controller-17.11.01a" >&2
+  exit 2
+fi
+
+here=$(cd "$(dirname "$0")" && pwd)
+net=ztp-test-net
+srv_image=ztp-test-server:latest
+dhcp=ztp-test-dhcp
+http=ztp-test-http
+dut=ztp-test-dut
+
+red() { echo -e "\e[31m$*\e[0m"; }
+green() { echo -e "\e[32m$*\e[0m"; }
+
+cleanup() {
+  docker rm -f "$dut" "$dhcp" "$http" >/dev/null 2>&1
+  docker network rm "$net" >/dev/null 2>&1
+}
+trap cleanup EXIT
+cleanup
+
+set -e
+echo "Building ZTP server image (dnsmasq + http)..."
+docker build -t "$srv_image" "$here" >/dev/null
+docker network create --subnet 172.31.99.0/24 "$net" >/dev/null
+docker run -d --name "$dhcp" --network "$net" --ip 172.31.99.10 --cap-add NET_ADMIN "$srv_image" >/dev/null
+docker run -d --name "$http" --network "$net" --ip 172.31.99.11 \
+  --entrypoint python3 "$srv_image" -m http.server 80 --directory /srv/www >/dev/null
+echo "Booting DUT ($image) in ztp + passthrough + DHCP mode..."
+docker run -d --privileged --network "$net" --ip 172.31.99.5 \
+  -e MODE=ztp -e CLAB_MGMT_PASSTHROUGH=true -e CLAB_MGMT_DHCP=true \
+  --name "$dut" "$image" >/dev/null
+set +e
+
+fail() { red "FAIL: $1"; echo "----- DUT logs (tail) -----"; docker logs "$dut" 2>&1 | tail -25; exit 1; }
+
+# 1) becomes healthy (launcher marked it up on the DHCP lease)
+echo "[1/3] waiting for DUT to become healthy (day-zero boot + DHCP lease)..."
+SECONDS=0; health=""
+while [ $SECONDS -lt "$timeout" ] && [ "$health" != "healthy" ]; do
+  sleep 3
+  health=$(docker inspect --format '{{.State.Health.Status}}' "$dut" 2>/dev/null)
+done
+[ "$health" = "healthy" ] || fail "DUT not healthy after ${SECONDS}s"
+green "      OK: healthy in ${SECONDS}s"
+
+# 2) device fetched ztp.py over HTTP (GET from a leased 172.31.99.1xx address)
+echo "[2/3] waiting for the device to fetch ztp.py over HTTP..."
+for _ in $(seq 1 60); do
+  docker logs "$http" 2>&1 | grep -qE '172\.31\.99\.1[0-9][0-9].*GET /ztp.py' && break
+  sleep 3
+done
+docker logs "$http" 2>&1 | grep -qE '172\.31\.99\.1[0-9][0-9].*GET /ztp.py' \
+  || fail "device never fetched ztp.py (dnsmasq: $(docker logs "$dhcp" 2>&1 | grep -c DHCPACK) ACKs)"
+green "      OK: $(docker logs "$http" 2>&1 | grep -cE 'GET /ztp.py') HTTP fetch(es) of ztp.py"
+
+# 3) ztp.py applied -- device renamed itself to C8000V-ZTP-OK
+echo "[3/3] waiting for Guest Shell to apply ztp.py (hostname change)..."
+applied=""
+for _ in $(seq 1 40); do
+  out=$(docker exec -i "$dut" /.venv/bin/python - < "$here/query_console.py" 2>/dev/null | tr -d '\000')
+  if echo "$out" | grep -q 'C8000V-ZTP-OK'; then applied=1; break; fi
+  sleep 6
+done
+[ -n "$applied" ] || fail "ztp.py did not apply (hostname never changed to C8000V-ZTP-OK)"
+green "      OK: ztp.py applied -- device renamed to C8000V-ZTP-OK"
+
+green "PASS: c8000v ZTP end-to-end (healthy + fetched + applied)"
