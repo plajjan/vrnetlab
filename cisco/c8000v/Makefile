@@ -24,10 +24,16 @@ docker-build: docker-build-common
 		docker rm -f $$(cat cidfile); \
 		rm -f cidfile; \
 	else \
-		echo "Skipping install step for controller mode (serial-enabled image)"; \
+		echo "Skipping install step for $(MODE) mode (serial-enabled image)"; \
 	fi
 
-# Override default to build both autonomous and controller mode variants
+# Override default to build the autonomous, controller and ztp mode variants.
+# The controller and ztp variants both skip the autonomous install step, so they
+# stay pristine (empty startup-config) -- ztp needs that to enter day-zero ZTP.
+# Because MODE is the very last layer in the Dockerfile (after the qcow2 and the
+# *.py), and ENV is a metadata-only instruction, the controller and ztp tags
+# share every filesystem layer (base + qcow2 + launch.py) and add zero extra
+# bytes -- the qcow2 is stored on disk only once.
 docker-image:
 	for IMAGE in $(IMAGES); do \
 		echo "Building autonomous mode variant for $$IMAGE"; \
@@ -36,6 +42,10 @@ docker-image:
 		echo "Building controller mode variant for $$IMAGE"; \
 		VER=$$($(MAKE) -s IMAGE=$$IMAGE print-version); \
 		$(MAKE) IMAGE=$$IMAGE VERSION=controller-$$VER MODE=controller docker-build; \
+		$(MAKE) IMAGE=$$IMAGE docker-clean-build; \
+		echo "Building ztp mode variant for $$IMAGE"; \
+		VER=$$($(MAKE) -s IMAGE=$$IMAGE print-version); \
+		$(MAKE) IMAGE=$$IMAGE VERSION=ztp-$$VER MODE=ztp docker-build; \
 		$(MAKE) IMAGE=$$IMAGE docker-clean-build; \
 	done
 
