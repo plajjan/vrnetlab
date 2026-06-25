@@ -128,6 +128,25 @@ class C8000v_vm(vrnetlab.VM):
         if self.mode != "ztp":
             self.qemu_args.extend(["-cdrom", "/" + self.image_name])
 
+    def gen_mgmt(self):
+        # If containerlab gives this node no management network (`network-mode:
+        # none`), there is no eth0. Build a management-less node: skip the mgmt
+        # NIC entirely (no qemu user-net/SLIRP, no passthrough) so the first data
+        # link becomes GigabitEthernet1 and IOS-XE day-zero ZTP runs in-band over
+        # it. A synthesized SLIRP mgmt port would otherwise grab its own DHCP
+        # lease + default route and sabotage day-zero ZTP on the data interface.
+        # num_mgmt_nics is set to 0 so nic_provision_delay() doesn't wait for an
+        # eth0 that will never appear.
+        if not os.path.exists(f"/sys/class/net/{self.mgmt_intf}"):
+            self.logger.info(
+                "No management interface (%s) present; building a management-less "
+                "node (no mgmt NIC) -- data/ZTP interfaces only.",
+                self.mgmt_intf,
+            )
+            self.num_mgmt_nics = 0
+            return []
+        return super().gen_mgmt()
+
     def gen_install_config(self) -> str:
         """
         Returns the configuration to load in install mode
