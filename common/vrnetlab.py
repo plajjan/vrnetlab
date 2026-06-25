@@ -242,6 +242,10 @@ class VM:
         self.fake_start_date = None
         self.nic_type = "e1000"
         self.num_nics = 0
+        # number of management NICs gen_mgmt() creates, and thus how many extra
+        # interfaces nic_provision_delay() expects alongside the data NICs. A
+        # subclass building a management-less node (no mgmt network) sets this 0.
+        self.num_mgmt_nics = 1
         # number of nics that are actually *provisioned* (as in nics that will be added to container)
         self.num_provisioned_nics = int(os.environ.get("CLAB_INTFS", 0))
         # "highest" provisioned nic num -- used for making sure we can allocate nics without needing
@@ -763,8 +767,12 @@ class VM:
         inf_path = Path("/sys/class/net/")
         while True:
             provisioned_nics = list(inf_path.glob(f"{self.data_intf_prefix}*"))
-            # if we see num provisioned +1 (for mgmt) we have all nics ready to roll!
-            if len(provisioned_nics) >= self.num_provisioned_nics + 1:
+            # We're ready once the provisioned data interfaces have appeared
+            # alongside the management interface(s) gen_mgmt() created: data NICs
+            # show up as eth1.. and a mgmt NIC (if any) as eth0, so the glob holds
+            # num_provisioned + num_mgmt_nics. A management-less node sets
+            # num_mgmt_nics = 0 (e.g. containerlab `network-mode: none`).
+            if len(provisioned_nics) >= self.num_provisioned_nics + self.num_mgmt_nics:
                 nics = [
                     int(re.search(pattern=r"\d+", string=nic.name).group())
                     for nic in provisioned_nics
