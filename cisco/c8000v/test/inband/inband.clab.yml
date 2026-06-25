@@ -1,0 +1,36 @@
+# In-band ZTP test for c8000v under containerlab.
+#
+# The DUT performs IOS-XE day-zero Zero Touch Provisioning in-band over a real
+# data interface, with the containerlab management bridge removed *entirely* via
+# `network-mode: none`. Combined with the launcher's management-less mode (no
+# eth0 => no qemu user-net/SLIRP mgmt NIC), the DUT has NO management interface
+# at all: its single clab link becomes GigabitEthernet1, and that is the
+# interface ZTP runs on. A directly-attached "ztp" node serves dnsmasq (DHCP
+# option 67 -> http URL) plus an HTTP server for the ztp.py artifact. No DHCP
+# relay -- the server is L2-adjacent on the link.
+#
+# Why no management interface (rather than just `network-mode: none`): a
+# synthesized SLIRP mgmt port would grab its own DHCP lease + default route and
+# sabotage day-zero ZTP on the data interface. Removing it lets ZTP complete --
+# verified: with the SLIRP Gi1 present the device DHCPs on Gi2 but never fetches
+# the artifact; with no mgmt NIC the data link becomes Gi1 and ZTP completes.
+#
+# Requires the launcher fixes on this branch: nic_provision_delay no longer waits
+# for a mgmt eth0 that never appears, and gen_mgmt skips the mgmt NIC when there
+# is no management network.
+name: c8000v-ztp-inband
+
+topology:
+  nodes:
+    dut:
+      kind: cisco_c8000v
+      # pristine, serial-enabled, MODE=ztp baked in (see ../../Makefile)
+      image: ${DUT_IMAGE:=vrnetlab/cisco_c8000v:ztp-17.11.01a}
+      network-mode: none          # no clab mgmt bridge -> management-less node
+
+    ztp:
+      kind: linux
+      image: ztp-inband-server:latest   # dnsmasq (opt 67) + http server (ztp.py)
+
+  links:
+    - endpoints: ["dut:eth1", "ztp:eth1"]   # becomes DUT Gi1 <-> ztp server

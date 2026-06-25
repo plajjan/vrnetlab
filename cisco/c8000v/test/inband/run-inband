@@ -1,0 +1,101 @@
+#!/bin/bash
+#
+# Functional end-to-end test for c8000v IN-BAND ztp under containerlab.
+#
+# Boots the DUT with NO management interface at all (containerlab
+# `network-mode: none` + the launcher's management-less mode), so its single
+# clab data link becomes GigabitEthernet1 and IOS-XE day-zero ZTP runs in-band
+# over it. A directly-attached dnsmasq+HTTP "ztp" node serves DHCP option 67 (an
+# http:// URL) and the ztp.py artifact -- no DHCP relay, the server is
+# L2-adjacent on the link. It asserts the three things that matter:
+#
+#   1. the DUT becomes healthy and DHCPs in-band (DHCPACK on the data link)
+#   2. the DUT fetches ztp.py over HTTP from its leased address
+#   3. ztp.py is applied (the device renamed itself to C8000V-ZTP-OK)
+#
+# Requirements: docker, KVM (/dev/kvm), and a pristine, serial-enabled c8000v
+# image with MODE=ztp -- the ztp-tagged build, e.g.
+# vrnetlab/cisco_c8000v:ztp-17.11.01a (see ../../Makefile `docker-image`).
+# containerlab is used from PATH if present, otherwise via the official clab
+# container image (docker-out-of-docker), so no host install / root is required.
+# This needs KVM, so it is NOT wired into CI; run it by hand or on a KVM runner.
+#
+# Usage: ./run-inband [<c8000v-ztp-image>]
+set -u
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../../../.." && pwd)          # repo root (for the clab-in-container mount)
+
+export DUT_IMAGE=${1:-vrnetlab/cisco_c8000v:ztp-17.11.01a}
+clab_version=${CLAB_VERSION:-0.69.3}
+boot_timeout=${BOOT_TIMEOUT:-420}
+
+lab=c8000v-ztp-inband
+dut=clab-$lab-dut
+srv=clab-$lab-ztp
+
+red() { echo -e "\e[31m$*\e[0m"; }
+green() { echo -e "\e[32m$*\e[0m"; }
+
+# Use a native containerlab if available, otherwise the official clab container
+# image (privileged, host net/pid + docker socket) so it can drive sibling
+# containers -- mirrors the stratoweave clab.mk pattern.
+if command -v containerlab >/dev/null 2>&1; then
+  CLAB=(containerlab)
+else
+  CLAB=(docker run --rm --privileged --network host --pid host
+    -e DUT_IMAGE
+    -v /var/run/docker.sock:/var/run/docker.sock
+    -v /var/run/netns:/var/run/netns
+    -v /etc/hosts:/etc/hosts
+    -v /var/lib/docker/containers:/var/lib/docker/containers
+    -v "$root":"$root" -w "$here"
+    "ghcr.io/srl-labs/clab:$clab_version" containerlab)
+fi
+
+cleanup() { (cd "$here" && "${CLAB[@]}" destroy -t inband.clab.yml --cleanup) >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+cleanup
+
+set -e
+echo "Building ztp-inband-server image (dnsmasq + http)..."
+docker build -t ztp-inband-server:latest -f "$here/Dockerfile" "$here/.." >/dev/null
+echo "Deploying in-band topology (DUT image: $DUT_IMAGE)..."
+(cd "$here" && "${CLAB[@]}" deploy -t inband.clab.yml --reconfigure) >/dev/null
+set +e
+
+fail() { red "FAIL: $1"; echo "----- DUT logs (tail) -----"; docker logs "$dut" 2>&1 | tail -25; exit 1; }
+
+# 1) becomes healthy + DHCPs in-band on the data link
+echo "[1/3] waiting for DUT to boot day-zero and DHCP in-band..."
+SECONDS=0; health=""
+while [ $SECONDS -lt "$boot_timeout" ] && [ "$health" != "healthy" ]; do
+  sleep 3
+  health=$(docker inspect -f '{{.State.Health.Status}}' "$dut" 2>/dev/null)
+done
+[ "$health" = "healthy" ] || fail "DUT not healthy after ${SECONDS}s"
+docker logs "$srv" 2>&1 | grep -q 'DHCPACK(eth1)' || fail "no in-band DHCPACK on the data link"
+green "      OK: healthy in ${SECONDS}s, in-band DHCPACK seen"
+
+# 2) device fetched ztp.py over HTTP from its in-band leased address
+echo "[2/3] waiting for the device to fetch ztp.py over HTTP (in-band)..."
+for _ in $(seq 1 60); do
+  docker logs "$srv" 2>&1 | grep -qE 'GET /ztp.py' && break
+  sleep 3
+done
+docker logs "$srv" 2>&1 | grep -qE 'GET /ztp.py' \
+  || fail "device never fetched ztp.py in-band ($(docker logs "$srv" 2>&1 | grep -c DHCPACK) DHCPACKs)"
+green "      OK: $(docker logs "$srv" 2>&1 | grep -cE 'GET /ztp.py') in-band HTTP fetch(es) of ztp.py"
+
+# 3) ztp.py applied -- device renamed itself to C8000V-ZTP-OK
+echo "[3/3] waiting for Guest Shell to apply ztp.py (hostname change)..."
+applied=""
+for _ in $(seq 1 40); do
+  out=$(docker exec -i "$dut" /.venv/bin/python - < "$here/../query_console.py" 2>/dev/null | tr -d '\000')
+  if echo "$out" | grep -q 'C8000V-ZTP-OK'; then applied=1; break; fi
+  sleep 6
+done
+[ -n "$applied" ] || fail "ztp.py did not apply (hostname never changed to C8000V-ZTP-OK)"
+green "      OK: ztp.py applied in-band -- device renamed to C8000V-ZTP-OK"
+
+green "PASS: c8000v in-band ZTP (no mgmt interface; ZTP over GigabitEthernet1)"
